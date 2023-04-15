@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_cluster import knn_graph
+from torch_geometric.nn import EdgeConv, DynamicEdgeConv
 from torch_geometric.nn.conv import GATv2Conv
 
 
@@ -180,32 +181,54 @@ class LocalGrouper(nn.Module):
         return new_xyz, new_points
 
 
-class ConvBNReLU1D(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=1, bias=True, activation='relu'):
-        super(ConvBNReLU1D, self).__init__()
-        self.act = get_activation(activation)
-        self.net = nn.Sequential(
-            # nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, bias=bias),
-            GATv2Conv(in_channels=in_channels, out_channels=out_channels),
-            nn.BatchNorm1d(out_channels),
-            self.act
-        )
+class CustomEmbedding(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=1, bias=True, activation='relu', mode="original"):
+        super(CustomEmbedding, self).__init__()
 
-        self.gat = GATv2Conv(in_channels, out_channels, heads=1)
+        self.act = get_activation(activation)
         self.norm = nn.BatchNorm1d(out_channels)
+        self.mode = mode
+
+        if self.mode == "gat":
+            self.gat = GATv2Conv(in_channels, out_channels, heads=1)
+        elif self.mode in ["dynamic", "edge"]:
+            mlp = nn.Sequential(nn.Linear(2 * in_channels, out_channels),
+                                nn.ReLU(),
+                                nn.Linear(out_channels, out_channels))
+
+            if self.mode == "edge":
+                self.edge_conv = EdgeConv(mlp)
+            else:
+                self.dynamic_edge_conv = DynamicEdgeConv(mlp, k=6)
+        else:
+            self.net = nn.Sequential(
+                nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, bias=bias),
+                self.norm,
+                self.act
+            )
 
     def forward(self, x):
-        new_xs = []
-        for i in range(x.shape[0]):
-            edge_index = knn_graph(x[i].permute(1, 0), k=6, loop=True)
-            new_x_i = self.gat(x[i].permute(1, 0), edge_index)
-            new_xs.append(torch.unsqueeze(new_x_i, dim=0))
+        if self.mode != "original":
+            new_xs = []
+            for i in range(x.shape[0]):
+                if self.mode != "dynamic":
+                    edge_index = knn_graph(x[i].permute(1, 0), k=6, loop=True)
+                    if self.mode == "gat":
+                        new_x_i = self.gat(x[i].permute(1, 0), edge_index)
+                    else:
+                        new_x_i = self.edge_conv(x[i].permute(1, 0), edge_index)
+                else:
+                    new_x_i = self.dynamic_edge_conv(x[i].permute(1, 0))
 
-        new_x = torch.cat(new_xs, dim=0)
+                new_xs.append(torch.unsqueeze(new_x_i, dim=0))
 
-        new_x = new_x.permute(0, 2, 1)
-        new_x = self.norm(new_x)
-        new_x = self.act(new_x)
+            new_x = torch.cat(new_xs, dim=0)
+            new_x = new_x.permute(0, 2, 1)
+            new_x = self.norm(new_x)
+            new_x = self.act(new_x)
+
+        else:
+            new_x = self.net(x)
 
         return new_x
 
@@ -251,7 +274,7 @@ class PreExtraction(nn.Module):
         """
         super(PreExtraction, self).__init__()
         in_channels = 3 + 2 * channels if use_xyz else 2 * channels
-        self.transfer = ConvBNReLU1D(in_channels, out_channels, bias=bias, activation=activation)
+        self.transfer = CustomEmbedding(in_channels, out_channels, bias=bias, activation=activation)
         operation = []
         for _ in range(blocks):
             operation.append(
@@ -295,12 +318,12 @@ class Model(nn.Module):
     def __init__(self, points=1024, class_num=40, embed_dim=64, groups=1, res_expansion=1.0,
                  activation="relu", bias=True, use_xyz=True, normalize="center",
                  dim_expansion=[2, 2, 2, 2], pre_blocks=[2, 2, 2, 2], pos_blocks=[2, 2, 2, 2],
-                 k_neighbors=[32, 32, 32, 32], reducers=[2, 2, 2, 2], **kwargs):
+                 k_neighbors=[32, 32, 32, 32], reducers=[2, 2, 2, 2], mode="original", **kwargs):
         super(Model, self).__init__()
         self.stages = len(pre_blocks)
         self.class_num = class_num
         self.points = points
-        self.embedding = ConvBNReLU1D(3, embed_dim, bias=bias, activation=activation)
+        self.embedding = CustomEmbedding(3, embed_dim, bias=bias, activation=activation, mode=mode)
         assert len(pre_blocks) == len(k_neighbors) == len(reducers) == len(pos_blocks) == len(dim_expansion), \
             "Please check stage number consistent for pre_blocks, pos_blocks k_neighbors, reducers."
         self.local_grouper_list = nn.ModuleList()
@@ -358,11 +381,11 @@ class Model(nn.Module):
         return x
 
 
-def pointMLP(num_classes=40, **kwargs) -> Model:
+def pointMLP(num_classes=40, mode="original", **kwargs) -> Model:
     return Model(points=1024, class_num=num_classes, embed_dim=64, groups=1, res_expansion=1.0,
                  activation="relu", bias=False, use_xyz=False, normalize="anchor",
                  dim_expansion=[2, 2, 2, 2], pre_blocks=[2, 2, 2, 2], pos_blocks=[2, 2, 2, 2],
-                 k_neighbors=[24, 24, 24, 24], reducers=[2, 2, 2, 2], **kwargs)
+                 k_neighbors=[24, 24, 24, 24], reducers=[2, 2, 2, 2], mode="original", **kwargs)
 
 
 def pointMLPElite(num_classes=40, **kwargs) -> Model:
